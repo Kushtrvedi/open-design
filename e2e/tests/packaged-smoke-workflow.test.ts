@@ -29,6 +29,12 @@ const bakePreviewsAutomergeWorkflowPath = join(
   "bake-plugin-previews-automerge.yml",
 );
 const bakePreviewsWorkflowPath = join(workspaceRoot, ".github", "workflows", "bake-plugin-previews.yml");
+const bakePreviewsReleaseWorkflowPath = join(
+  workspaceRoot,
+  ".github",
+  "workflows",
+  "bake-plugin-previews-release.yml",
+);
 const finalizeReleaseWorkflowPath = join(workspaceRoot, ".github", "workflows", "finalize-release.yml");
 const handoffScriptPath = join(workspaceRoot, ".github", "scripts", "handoff.py");
 const releaseBetaWorkflowPath = join(workspaceRoot, ".github", "workflows", "release-beta.yml");
@@ -337,12 +343,40 @@ describe("packaged smoke workflow", () => {
     expect(dockerTrigger).not.toContain("branches: [main]");
     expect(dockerTrigger).not.toContain("- main");
     expect(commentWorkflow).toContain("workflows: [ci]");
-    expect(commentWorkflow).toContain("github.event.workflow_run.event == 'pull_request'");
+    // comment.atom consumes merge_group runs too, so the needs-validation gate can surface a
+    // queue-ejection notice on the PR; autofix/report stay pull_request-only trusted consumers.
+    expect(commentWorkflow).toContain(
+      "(github.event.workflow_run.event == 'pull_request' || github.event.workflow_run.event == 'merge_group')",
+    );
     expect(autofixWorkflow).toContain("workflows: [ci]");
     expect(autofixWorkflow).toContain("github.event.workflow_run.event == 'pull_request'");
+    expect(autofixWorkflow).not.toContain("merge_group");
     expect(autofixWorkflow).not.toContain("ci-nix");
     expect(reportWorkflow).toContain("workflows: [ci]");
     expect(reportWorkflow).toContain("github.event.workflow_run.event == 'pull_request'");
+    expect(reportWorkflow).not.toContain("merge_group");
+  });
+
+  it("[P2] surfaces a merge-queue needs-validation ejection as a PR comment handoff", async () => {
+    const [ciWorkflow, commentWorkflow] = await Promise.all([
+      readFile(ciWorkflowPath, "utf8"),
+      readFile(commentWorkflowPath, "utf8"),
+    ]);
+
+    // Producer: the merge_group gate emits a handoff/comment artifact for the labeled PR when
+    // it blocks, and uploads it on the failure path (the gate exits 1 exactly when it produces).
+    expect(ciWorkflow).toContain("<!-- merge-queue-needs-validation -->");
+    expect(ciWorkflow).toContain("emit_ejection_notice");
+    expect(ciWorkflow).toContain(
+      "if: ${{ failure() && steps.needs_validation_gate.outputs.comment_created == 'true' }}",
+    );
+
+    // Consumer: a merge_group run's head_sha is the queue's synthetic merge commit, so the atom
+    // binds merge_group artifacts to their producing run by run_id and skips the base-freshness
+    // check (PRs ahead in the queue move the base while the run completes).
+    expect(commentWorkflow).toContain('"$RUN_EVENT" = "merge_group"');
+    expect(commentWorkflow).toContain('"$artifact_run_id" != "$RUN_ID"');
+    expect(commentWorkflow).toContain('[ "$RUN_EVENT" != "merge_group" ] && [ "$current_base" != "$base_sha" ]');
   });
 
   it("[P2] gates the backport auto-merge follow-up as a trusted workflow_run consumer", async () => {
@@ -814,6 +848,32 @@ process.stdin.on("end", () => {
     expect(workflow).not.toContain("git/ref/heads/main");
   });
 
+  it("[P2] keeps the release-cut bake pushing its manifest as a ruleset bypass bot", async () => {
+    // release/** is guarded by the "Protected branches (preview/*, release/v*)" ruleset whose
+    // pull_request rule rejects a direct push (GH013) unless the pusher is a bypass actor. The
+    // release-cut bake writes the authoritative manifest straight onto the release branch, so it
+    // must push as open-design-bot — a bypass actor on that ruleset — not github-actions[bot],
+    // which is NOT and gets rejected (this stranded release/v0.14.2's manifest). These three auth
+    // invariants only work together; a refactor that drops any one silently reintroduces the
+    // GH013 regression, so lock them here rather than rely on YAML review.
+    const workflow = await readFile(bakePreviewsReleaseWorkflowPath, "utf8");
+
+    // 1. Checkout must NOT persist GITHUB_TOKEN: its http.extraheader would override the inline bot
+    //    token on push and re-authenticate as github-actions[bot] (the same override fixed in the
+    //    post-merge bake — #5357).
+    expect(workflow).toContain("persist-credentials: false");
+    // 2. The run mints an open-design-bot token via the BOT_APP_* creds — the App that IS a bypass
+    //    actor on the release ruleset. RELEASE_BOT_APP_ID (used by the post-merge bake) is a
+    //    different App and is NOT a bypass actor, so pin the correct credentials, not just the
+    //    generic token action.
+    expect(workflow).toContain("actions/create-github-app-token");
+    expect(workflow).toContain("secrets.BOT_APP_CLIENT_ID");
+    expect(workflow).toContain("secrets.BOT_APP_PRIVATE_KEY");
+    // 3. The manifest push goes through the explicit tokenized URL with that bot token, so it
+    //    authenticates as the bypass actor rather than the checkout's default credential.
+    expect(workflow).toContain("x-access-token:${BOT_TOKEN}");
+  });
+
   it("[P2] keeps PR and merge queue CI separated by hot/full validation mode", async () => {
     const workflow = await readFile(ciWorkflowPath, "utf8");
     const scopes = sectionBetween(workflow, "  scopes:", "  static_gate:");
@@ -1233,6 +1293,38 @@ process.stdin.on("end", () => {
 
     expect(prereleaseWorkflow).toContain("OPEN_DESIGN_STABLE_VERSION: ${{ inputs.release_version }}");
     expect(prereleaseWorkflow).toContain("Required when ref is not release/vX.Y.Z");
+  });
+
+  it("[P2] publishes release notes through one channel-neutral tools-release pipeline", async () => {
+    const workflows = await Promise.all([
+      readFile(releaseBetaWorkflowPath, "utf8"),
+      readFile(releaseBetaSelfHostedWorkflowPath, "utf8"),
+      readFile(releasePrereleaseWorkflowPath, "utf8"),
+      readFile(releasePreviewWorkflowPath, "utf8"),
+      readFile(releaseStableWorkflowPath, "utf8"),
+    ]);
+
+    for (const workflow of workflows) {
+      expect(workflow).toContain("tools-release prepare-release-note");
+      expect(workflow).toContain("tools-release publish-release-note");
+      expect(workflow).toContain("tools-release verify-release-note");
+      expect(workflow).toContain("RELEASE_NOTE_MANIFEST_PATH:");
+      expect(workflow.indexOf("tools-release prepare-release-note")).toBeLessThan(
+        workflow.indexOf("tools-release publish-release-note"),
+      );
+      expect(workflow.indexOf("tools-release publish-release-note")).toBeLessThan(
+        workflow.indexOf("tools-release verify-release-note"),
+      );
+      expect(workflow.indexOf("tools-release verify-release-note")).toBeLessThan(
+        workflow.indexOf("tools-release publish-metadata"),
+      );
+    }
+
+    const stableWorkflow = workflows[4] ?? "";
+    expect(stableWorkflow).toContain("Validate stable release note policy");
+    expect(stableWorkflow).toContain(
+      "RELEASE_PUBLISH_SIDE_EFFECTS: ${{ needs.metadata.outputs.publish_side_effects_enabled }}",
+    );
   });
 
   it("[P2] requires stable release dispatch to use the release version branch", async () => {

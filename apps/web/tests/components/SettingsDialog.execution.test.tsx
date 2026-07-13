@@ -108,10 +108,16 @@ import { IntegrationsView } from '../../src/components/IntegrationsView';
 import type { AgentRefreshOptions, SettingsSection } from '../../src/components/SettingsDialog';
 import { reconcileAmrModelChoice } from '../../src/components/SettingsDialog';
 import { reconcileAmrProfileEnv } from '../../src/components/SettingsDialog';
+import { providerModelsCacheKey } from '../../src/components/providerModelsCache';
 import { I18nProvider } from '../../src/i18n';
 import { LOCALES } from '../../src/i18n/types';
 import { MAX_MAX_TOKENS, MIN_MAX_TOKENS } from '../../src/state/maxTokens';
-import type { AgentInfo, AppConfig, AppVersionInfo } from '../../src/types';
+import type {
+  AgentInfo,
+  AppConfig,
+  AppVersionInfo,
+  ProviderModelOption,
+} from '../../src/types';
 
 const baseConfig: AppConfig = {
   mode: 'api',
@@ -269,6 +275,7 @@ function renderSettingsDialog(
     onRefreshAgents?: OnRefreshAgents;
     initialSection?: SettingsSection;
     appVersionInfo?: AppVersionInfo | null;
+    providerModelsCache?: Record<string, ProviderModelOption[]>;
     welcome?: boolean;
   } = {},
 ) {
@@ -284,6 +291,7 @@ function renderSettingsDialog(
       daemonLive={options.daemonLive ?? true}
       appVersionInfo={options.appVersionInfo ?? null}
       initialSection={options.initialSection ?? 'execution'}
+      providerModelsCache={options.providerModelsCache}
       welcome={options.welcome}
       onPersist={onPersist}
       onPersistComposioKey={onPersistComposioKey}
@@ -444,6 +452,55 @@ beforeEach(() => {
 afterEach(() => {
   restoreOpenDesignHost?.();
   restoreOpenDesignHost = null;
+});
+
+describe('SettingsDialog privacy settings interactions', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('preserves a pending privacy choice when an unrelated parent config update arrives', async () => {
+    const randomUUID = vi.fn(() => 'inst-new');
+    vi.stubGlobal('crypto', { randomUUID });
+    const initial: AppConfig = {
+      ...baseConfig,
+      mode: 'daemon',
+      agentId: null,
+      installationId: null,
+      privacyDecisionAt: 1778244000000,
+      telemetry: { metrics: false, content: false, artifactManifest: true },
+    };
+    const view = renderSettingsDialog(initial, { initialSection: 'privacy' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Share' }));
+
+    await waitFor(() => {
+      expect((screen.getByLabelText('Anonymous ID') as HTMLInputElement).value).toBe('inst-new');
+    });
+
+    view.rerender(
+      <SettingsDialog
+        initial={{ ...initial, agentId: 'codex' }}
+        agents={availableAgents}
+        daemonLive={true}
+        appVersionInfo={null}
+        initialSection="privacy"
+        onPersist={view.onPersist}
+        onPersistComposioKey={view.onPersistComposioKey}
+        onClose={view.onClose}
+        onRefreshAgents={view.onRefreshAgents}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Share' }).getAttribute('aria-pressed'))
+      .toBe('true');
+    expect((screen.getByLabelText('Anonymous ID') as HTMLInputElement).value).toBe('inst-new');
+    expect(screen.getByRole('button', { name: /Anonymous metrics/ }).getAttribute('aria-pressed'))
+      .toBe('true');
+    expect(screen.getByRole('button', { name: /Conversation and tool content/ }).getAttribute('aria-pressed'))
+      .toBe('true');
+  });
 });
 
 describe('SettingsDialog execution settings BYOK interactions', () => {
@@ -734,6 +791,28 @@ describe('SettingsDialog execution settings BYOK interactions', () => {
 
     expect(screen.getByRole('combobox', { name: 'Model' }).textContent).toContain('deepseek-chat');
     expect((screen.getByLabelText('Base URL') as HTMLInputElement).value).toBe('https://api.deepseek.com');
+  });
+
+  it('offers Atlas Cloud as an OpenAI-compatible gateway preset', () => {
+    renderSettingsDialog({
+      apiProtocol: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o',
+      apiProviderBaseUrl: 'https://api.openai.com/v1',
+    });
+
+    fireEvent.click(screen.getByRole('tab', { name: 'OpenAI' }));
+    selectGatewayPreset('Atlas Cloud');
+
+    expect(screen.getByRole('combobox', { name: 'Model' }).textContent).toContain(
+      'qwen/qwen3.5-flash',
+    );
+    expect((screen.getByLabelText('Base URL') as HTMLInputElement).value).toBe(
+      'https://api.atlascloud.ai/v1',
+    );
+    expect(screen.getByRole('link', { name: 'Get key ↗' }).getAttribute('href')).toBe(
+      'https://atlascloud.ai/?utm_source=open_design&utm_medium=provider_preset&utm_campaign=atlascloud_byok',
+    );
   });
 
   it('keeps Anthropic-compatible gateway presets selectable', () => {
@@ -1505,6 +1584,43 @@ describe('SettingsDialog execution settings BYOK interactions', () => {
     await waitFor(() => {
       expect(screen.queryByText(/✓ Loaded \d+ models(?: from your account)?\./)).toBeNull();
     });
+  });
+
+  it('does not reuse discovered models for Anthropic full Messages endpoints', () => {
+    const messagesEndpoint = 'https://token-plan-cn.xiaomimimo.com/anthropic/v1/messages';
+    const staleDiscoveryKey = providerModelsCacheKey(
+      'anthropic',
+      messagesEndpoint,
+      'sk-mimo',
+      '',
+    );
+
+    renderSettingsDialog(
+      {
+        apiProtocol: 'anthropic',
+        apiKey: 'sk-mimo',
+        baseUrl: messagesEndpoint,
+        model: 'mimo-v2.5-pro',
+        apiProviderBaseUrl: null,
+      },
+      {
+        providerModelsCache: {
+          [staleDiscoveryKey]: [{ id: 'deepseek-chat', label: 'deepseek-chat' }],
+        },
+      },
+    );
+
+    fireEvent.click(screen.getByRole('combobox', { name: 'Model' }));
+    const modelPopover = screen.getByTestId('settings-byok-model-popover');
+
+    expect(optionNames(modelPopover)).not.toEqual(
+      expect.arrayContaining([expect.stringContaining('deepseek-chat')]),
+    );
+    expect(within(modelPopover).getByRole('option', { name: 'Custom (type below)…' })).toBeTruthy();
+    expect((screen.getByLabelText('Custom model id') as HTMLInputElement).value).toBe(
+      'mimo-v2.5-pro',
+    );
+    expect(fetchProviderModelsMock).not.toHaveBeenCalled();
   });
 
   it('renders automatic provider auth failures under the API key field', async () => {
@@ -4457,6 +4573,77 @@ describe('IntegrationsView skills tab', () => {
     });
     expect(screen.getByText('sales-deck')).toBeTruthy();
     expect(screen.queryByText('dashboard')).toBeNull();
+  });
+
+  it('updates skill filter counts from the current filter context', async () => {
+    fetchSkillsMock.mockResolvedValue([
+      {
+        id: 'product-image',
+        name: 'product-image',
+        description: 'Product image generation.',
+        mode: 'image',
+        category: 'marketing',
+        previewType: 'PNG',
+        source: 'built-in',
+      },
+      {
+        id: 'document-brief',
+        name: 'document-brief',
+        description: 'Document brief.',
+        mode: 'deck',
+        category: 'documents',
+        previewType: 'HTML',
+        source: 'built-in',
+      },
+      {
+        id: 'landing-page',
+        name: 'landing-page',
+        description: 'Landing page.',
+        mode: 'prototype',
+        category: 'marketing',
+        previewType: 'HTML',
+        source: 'built-in',
+      },
+    ]);
+
+    renderIntegrationsView(
+      { mode: 'daemon', agentId: 'codex' },
+      { initialTab: 'skills' },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('product-image')).toBeTruthy();
+      expect(screen.getByText('document-brief')).toBeTruthy();
+    });
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Type' }), {
+      target: { value: 'image' },
+    });
+
+    const categorySelect = screen.getByRole('combobox', { name: 'Category' });
+    expect(
+      within(categorySelect).getByRole('option', { name: 'Documents (0)' }),
+    ).toBeTruthy();
+    expect(
+      within(categorySelect).getByRole('option', { name: 'Marketing (1)' }),
+    ).toBeTruthy();
+
+    fireEvent.change(categorySelect, {
+      target: { value: 'documents' },
+    });
+
+    expect(screen.getByText('No items match your search.')).toBeTruthy();
+    expect(
+      within(screen.getByRole('combobox', { name: 'Category' })).getByRole(
+        'option',
+        { name: 'Documents (0)' },
+      ),
+    ).toBeTruthy();
+    expect(
+      within(screen.getByRole('combobox', { name: 'Type' })).getByRole('option', {
+        name: 'image (0)',
+      }),
+    ).toBeTruthy();
   });
 
   it('opens a skill detail panel and persists disabled skills from toggle switches', async () => {
