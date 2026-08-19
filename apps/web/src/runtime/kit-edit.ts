@@ -25,7 +25,7 @@ async function writeBrand(projectId: string, brand: Brand): Promise<boolean> {
 export async function patchBrand(projectId: string, mutate: (brand: Brand) => void): Promise<boolean> {
   const brand = await readBrand(projectId);
   if (!brand) return false;
-  mutate(brand);
+  guardedMutate("server", brand);
   return writeBrand(projectId, brand);
 }
 

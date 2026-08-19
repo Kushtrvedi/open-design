@@ -141,7 +141,7 @@ function withRound(
   const idx = rounds.findIndex((r) => r.n === n);
   if (idx === -1) {
     const seeded: CritiqueRound = { n, mustFix: 0, panelists: {} };
-    mutate(seeded);
+    guardedMutate("server", seeded);
     return [...rounds, seeded].sort((a, b) => a.n - b.n);
   }
   const next = rounds.slice();
@@ -149,7 +149,7 @@ function withRound(
     ...next[idx]!,
     panelists: { ...next[idx]!.panelists },
   };
-  mutate(cloned);
+  guardedMutate("server", cloned);
   next[idx] = cloned;
   return next;
 }
